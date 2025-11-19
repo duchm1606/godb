@@ -44,29 +44,23 @@ var TDEF_TABLE = &TableDef{
 
 // get a single row by primary key
 func dbGet(db *DB, tdef *TableDef, rec *Record) (bool, error) {
+	// We only allow range queries on the full primary key, but range queries on a prefix of the primary key are also legitimate. We’ll fix this in the next chapter, along with secondary index
 	// verify input is a complete primary key
-	values, err := checkRecord(tdef, *rec, tdef.PKeys)
-	if err != nil {
+	sc := Scanner{
+		Cmp1: CMP_GE,
+		Cmp2: CMP_LE,
+		Key1: *rec,
+		Key2: *rec,
+	}
+	if err := dbScan(db, tdef, &sc); err != nil {
 		return false, err
 	}
-
-	// encode primary key
-	key := encodeKey(nil, tdef.Prefix, values[:tdef.PKeys])
-	// query kv store
-	val, ok := db.kv.Get(key)
-	if !ok {
+	if sc.Valid() {
+		sc.Deref(rec)
+		return true, nil
+	} else {
 		return false, nil
 	}
-
-	for i := tdef.PKeys; i < len(tdef.Cols); i++ {
-		values[i].Type = tdef.Types[i]
-	}
-	// decode value
-	decodeValues(val, values[tdef.PKeys:])
-
-	rec.Cols = append(rec.Cols, tdef.Cols[tdef.PKeys:]...)
-	rec.Vals = append(rec.Vals, values[tdef.PKeys:]...)
-	return true, nil
 }
 
 // reorder a record and check for missing columns
@@ -217,4 +211,31 @@ func dbDelete(db *DB, tdef *TableDef, rec Record) (bool, error) {
 	}
 	key := encodeKey(nil, tdef.Prefix, values[:tdef.PKeys])
 	return db.kv.Del(key)
+}
+
+func dbScan(db *DB, tdef *TableDef, sc *Scanner) error {
+	// sanity checks
+	switch {
+	case sc.Cmp1 > 0 && sc.Cmp2 < 0:
+	case sc.Cmp2 > 0 && sc.Cmp1 < 0:
+	default:
+		return fmt.Errorf("bad range")
+	}
+
+	values1, err := checkRecord(tdef, sc.Key1, tdef.PKeys)
+	if err != nil {
+		return err
+	}
+	values2, err := checkRecord(tdef, sc.Key2, tdef.PKeys)
+	if err != nil {
+		return err
+	}
+
+	sc.tdef = tdef
+
+	// seek to start key
+	keyStart := encodeKey(nil, tdef.Prefix, values1[:tdef.PKeys])
+	sc.keyEnd = encodeKey(nil, tdef.Prefix, values2[:tdef.PKeys])
+	sc.iter = db.kv.tree.Seek(keyStart, sc.Cmp1)
+	return nil
 }
