@@ -1,9 +1,10 @@
-package btree
+package schema
 
+// Value types
 const (
-	TYPE_ERROR = 0 // error
-	TYPE_BYTES = 1 // string (of abitrary bytes)
-	TYPE_INT64 = 2 // integer; 64-bit signed
+	TypeError = 0 // error
+	TypeBytes = 1 // string (of arbitrary bytes)
+	TypeInt64 = 2 // integer; 64-bit signed
 )
 
 // table cell
@@ -13,8 +14,7 @@ type Value struct {
 	Str  []byte
 }
 
-// table row.
-// list of column names and values.
+// table row - list of column names and values
 type Record struct {
 	Cols []string
 	Vals []Value
@@ -22,13 +22,13 @@ type Record struct {
 
 func (rec *Record) AddStr(col string, val []byte) *Record {
 	rec.Cols = append(rec.Cols, col)
-	rec.Vals = append(rec.Vals, Value{Type: TYPE_BYTES, Str: val})
+	rec.Vals = append(rec.Vals, Value{Type: TypeBytes, Str: val})
 	return rec
 }
 
 func (rec *Record) AddInt64(col string, val int64) *Record {
 	rec.Cols = append(rec.Cols, col)
-	rec.Vals = append(rec.Vals, Value{Type: TYPE_INT64, I64: val})
+	rec.Vals = append(rec.Vals, Value{Type: TypeInt64, I64: val})
 	return rec
 }
 

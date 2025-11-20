@@ -2,9 +2,9 @@ package btree
 
 import (
 	"bytes"
-	"duchm1606/godb/internal/constants"
-	"duchm1606/godb/internal/util"
 	"encoding/binary"
+	"godb/internal/constants"
+	"godb/internal/util"
 )
 
 /**
@@ -41,11 +41,20 @@ type BNode struct {
 	data []byte // can be dumped to the disk
 }
 
-const HEADER = 4
+// GetData returns the underlying data slice
+func (node BNode) GetData() []byte {
+	return node.data
+}
 
+// NewBNode creates a new BNode with the given data
+func NewBNode(data []byte) BNode {
+	return BNode{data: data}
+}
+
+// Node Types
 const (
-	BNODE_NODE = 1 // internal node without values
-	BNODE_LEAF = 2 // leaf nodes with values
+	NodeTypeInternal = 1 // internal nodes without values
+	NodeTypeLeaf     = 2 // leaf nodes with values
 )
 
 // header
@@ -65,13 +74,13 @@ func (node BNode) setHeader(btype uint16, nkeys uint16) {
 // pointers
 func (node BNode) getPtr(idx uint16) uint64 {
 	util.Assert(idx < node.nkeys(), "getPtr: idx out of range")
-	pos := HEADER + 8*idx
+	pos := constants.HeaderSize + 8*idx
 	return binary.LittleEndian.Uint64(node.data[pos:])
 }
 
 func (node BNode) setPtr(idx uint16, val uint64) {
 	util.Assert(idx < node.nkeys(), "setPtr: idx out of range")
-	pos := HEADER + 8*idx
+	pos := constants.HeaderSize + 8*idx
 	binary.LittleEndian.PutUint64(node.data[pos:], val)
 }
 
@@ -79,7 +88,7 @@ func (node BNode) setPtr(idx uint16, val uint64) {
 // returns the value of the offset i.e. the location of the kv-pair at given index
 func offsetPos(node BNode, idx uint16) uint16 {
 	util.Assert(1 <= idx && idx <= node.nkeys(), "offsetPos: idx out of range")
-	return HEADER + 8*node.nkeys() + 2*(idx-1)
+	return constants.HeaderSize + 8*node.nkeys() + 2*(idx-1)
 }
 
 // returns offset of kv-pair at given index
@@ -97,7 +106,7 @@ func (node BNode) setOffset(idx uint16, offset uint16) {
 // returns position/byte-offset of kv-pair at idx
 func (node BNode) kvPos(idx uint16) uint16 {
 	util.Assert(idx <= node.nkeys(), "kvPos: idx out of range")
-	return HEADER + 8*node.nkeys() + 2*node.nkeys() + node.getOffset(idx)
+	return constants.HeaderSize + 8*node.nkeys() + 2*node.nkeys() + node.getOffset(idx)
 }
 
 // returns key of kv-pair at idx from data array
@@ -146,7 +155,7 @@ func nodeLookupLE(node BNode, key []byte) uint16 {
 
 // update a KV in a leaf node
 func leafUpdate(new BNode, old BNode, idx uint16, key []byte, val []byte) {
-	new.setHeader(BNODE_LEAF, old.nkeys())
+	new.setHeader(NodeTypeLeaf, old.nkeys())
 	nodeAppendRange(new, old, 0, 0, idx)                         // copy everything from old node to new up until the index
 	nodeAppendKV(new, idx, 0, key, val)                          // add new kv to new node
 	nodeAppendRange(new, old, idx+1, idx+1, old.nkeys()-(idx+1)) // copy everything from old node to new node starting after the inserted kv
@@ -154,7 +163,7 @@ func leafUpdate(new BNode, old BNode, idx uint16, key []byte, val []byte) {
 
 // add a new key to a leaf node
 func leafInsert(new BNode, old BNode, idx uint16, key []byte, val []byte) {
-	new.setHeader(BNODE_LEAF, old.nkeys()+1)
+	new.setHeader(NodeTypeLeaf, old.nkeys()+1)
 	nodeAppendRange(new, old, 0, 0, idx)                   // copy everything from old node to new up until the index
 	nodeAppendKV(new, idx, 0, key, val)                    // add new kv to new node
 	nodeAppendRange(new, old, idx+1, idx, old.nkeys()-idx) // copy everything from old node to new node starting after the inserted kv
@@ -216,28 +225,28 @@ func nodeSplit2(left BNode, right BNode, old BNode) {
 // split a node if it's too big. The results are 1~3 nodes
 // In the worst case, the fat node is split into 3 nodes (one large KV pair in the middle)
 func nodeSplit3(old BNode) (uint16, [3]BNode) {
-	if old.nbytes() <= constants.BtreePageSize {
-		old.data = old.data[:constants.BtreePageSize]
+	if old.nbytes() <= constants.PageSize {
+		old.data = old.data[:constants.PageSize]
 		return 1, [3]BNode{old}
 	}
-	left := BNode{data: make([]byte, 2*constants.BtreePageSize)} // might be split later
-	right := BNode{data: make([]byte, constants.BtreePageSize)}
+	left := BNode{data: make([]byte, 2*constants.PageSize)} // might be split later
+	right := BNode{data: make([]byte, constants.PageSize)}
 	nodeSplit2(left, right, old)
-	if left.nbytes() <= constants.BtreePageSize {
-		left.data = left.data[:constants.BtreePageSize]
+	if left.nbytes() <= constants.PageSize {
+		left.data = left.data[:constants.PageSize]
 		return 2, [3]BNode{left, right}
 	}
 	// the left node is still too large
-	leftleft := BNode{make([]byte, constants.BtreePageSize)}
-	middle := BNode{make([]byte, constants.BtreePageSize)}
+	leftleft := BNode{make([]byte, constants.PageSize)}
+	middle := BNode{make([]byte, constants.PageSize)}
 	nodeSplit2(leftleft, middle, left)
-	util.Assert(leftleft.nbytes() <= constants.BtreePageSize, "nodeSplit3: leftleft is too large")
+	util.Assert(leftleft.nbytes() <= constants.PageSize, "nodeSplit3: leftleft is too large")
 	return 3, [3]BNode{leftleft, middle, right}
 }
 
 // remove a key from a leaf node
 func leafDelete(new BNode, old BNode, idx uint16) {
-	new.setHeader(BNODE_LEAF, old.nkeys()-1)
+	new.setHeader(NodeTypeLeaf, old.nkeys()-1)
 	nodeAppendRange(new, old, 0, 0, idx)
 	nodeAppendRange(new, old, idx, idx+1, old.nkeys()-(idx+1))
 }
@@ -250,7 +259,7 @@ func nodeMerge(new BNode, left BNode, right BNode) {
 }
 
 func nodeReplace2Child(new BNode, old BNode, idx uint16, merged uint64, key []byte) {
-	new.setHeader(BNODE_NODE, old.nkeys()-1)
+	new.setHeader(NodeTypeInternal, old.nkeys()-1)
 	nodeAppendRange(new, old, 0, 0, idx)
 	nodeAppendKV(new, idx, merged, key, nil)
 	nodeAppendRange(new, old, idx+1, idx+2, old.nkeys()-(idx+1))

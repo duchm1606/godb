@@ -1,3 +1,3 @@
-module duchm1606/godb
+module godb
 
 go 1.25.1
