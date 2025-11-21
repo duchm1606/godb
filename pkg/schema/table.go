@@ -15,6 +15,10 @@ type TableDef struct {
 	PKeys int      // the first PKeys columns are the primary key
 	// auto-assigned B-tree key prefixes for different tables
 	Prefix uint32
+
+	// Migrate to multiple indexes and prefixes
+	Indexes  [][]string // the first index is the primary key
+	Prefixed []uint32
 }
 
 const TablePrefixMin = 3

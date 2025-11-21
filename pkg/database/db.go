@@ -13,7 +13,7 @@ import (
 type DB struct {
 	Path string
 	// internals
-	kv     storage.KV
+	Kv     storage.KV
 	tables map[string]*schema.TableDef // cached table definition
 }
 
@@ -151,7 +151,7 @@ func dbUpdate(db *DB, tdef *schema.TableDef, rec schema.Record, mode int) (bool,
 	key := schema.EncodeKey(nil, tdef.Prefix, values[:tdef.PKeys])
 	val := schema.EncodeValues(nil, values[tdef.PKeys:])
 	req := &btree.InsertReq{Key: key, Val: val, Mode: mode}
-	return db.kv.Update(req)
+	return db.Kv.Update(req)
 }
 
 func dbDelete(db *DB, tdef *schema.TableDef, rec schema.Record) (bool, error) {
@@ -160,7 +160,7 @@ func dbDelete(db *DB, tdef *schema.TableDef, rec schema.Record) (bool, error) {
 		return false, err
 	}
 	key := schema.EncodeKey(nil, tdef.Prefix, values[:tdef.PKeys])
-	return db.kv.Del(key)
+	return db.Kv.Del(key)
 }
 
 // get a single row by primary key
@@ -171,7 +171,7 @@ func dbGet(db *DB, tdef *schema.TableDef, rec *schema.Record) (bool, error) {
 		return false, err
 	}
 	key := schema.EncodeKey(nil, tdef.Prefix, values)
-	val, found := db.kv.Get(key)
+	val, found := db.Kv.Get(key)
 	if !found {
 		return false, nil
 	}
