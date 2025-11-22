@@ -16,23 +16,23 @@ func main() {
 	pages := make(map[uint64]btree.BNode)
 	var nextPtr uint64 = 1
 
-	tree.SetCallbacks(
-		func(ptr uint64) btree.BNode {
-			if node, ok := pages[ptr]; ok {
-				return node
-			}
-			panic("page not found")
-		},
-		func(node btree.BNode) uint64 {
-			ptr := nextPtr
-			nextPtr++
-			pages[ptr] = node
-			return ptr
-		},
-		func(ptr uint64) {
-			delete(pages, ptr)
-		},
-	)
+	// tree.SetCallbacks(
+	// 	func(ptr uint64) btree.BNode {
+	// 		if node, ok := pages[ptr]; ok {
+	// 			return node
+	// 		}
+	// 		panic("page not found")
+	// 	},
+	// 	func(node btree.BNode) uint64 {
+	// 		ptr := nextPtr
+	// 		nextPtr++
+	// 		pages[ptr] = node
+	// 		return ptr
+	// 	},
+	// 	func(ptr uint64) {
+	// 		delete(pages, ptr)
+	// 	},
+	// )
 
 	// Test basic operations
 	tree.Insert([]byte("hello"), []byte("world"))

@@ -2,141 +2,151 @@ package storage
 
 import (
 	"encoding/binary"
-	"errors"
 	"godb/internal/constants"
 	"godb/internal/util"
-	"godb/pkg/btree"
 )
 
-const NodeTypeFreeList = 3
+const FREE_LIST_HEADER = 8
 
-var (
-	ErrEmptyFreeListNode = errors.New("empty free list node")
-	ErrIndexOutOfBound   = "ErrIndexOutOfBound"
-)
+/*
+Present a free list node
 
+Each node starts with a pointer to the next node.
+Items are appended next to it.
+
+Node format:
+
+| next | pointers | unused |
+
+| 8B | n*8B | ... |
+*/
+type LNode []byte
+
+func (node LNode) getNext() uint64 {
+	return binary.LittleEndian.Uint64(node[:8])
+}
+
+func (node LNode) setNext(next uint64) {
+	binary.LittleEndian.PutUint64(node[:8], next)
+}
+
+func (node LNode) getPtr(idx int) uint64 {
+	offset := FREE_LIST_HEADER + 8*idx
+	return binary.LittleEndian.Uint64(node[offset:])
+}
+func (node LNode) setPtr(idx int, ptr uint64) {
+	offset := FREE_LIST_HEADER + 8*idx
+	binary.LittleEndian.PutUint64(node[offset:], ptr)
+}
+
+// FreeList manages unused pages
 type FreeList struct {
-	head uint64
 	// callbacks for managing on-disk pages
-	get func(uint64) btree.BNode  // dereference a pointer
-	new func(btree.BNode) uint64  // append a new page
-	use func(uint64, btree.BNode) // reuse a page
+	get func(uint64) []byte // read a page
+	new func([]byte) uint64 // append a new page
+	set func(uint64) []byte // update an existing page
+
+	// persited data in the meta page
+	headPage uint64 // pointer to the list head node
+	headSeq  uint64 // monotonic sequence number to index into the list head
+	tailPage uint64
+	tailSeq  uint64
+
+	// in-memory states
+	maxSeq uint64 // save `tailSeq` to prevent consuming newly added items
 }
 
-func flnSize(node btree.BNode) int {
-	return int(binary.LittleEndian.Uint16(node.GetData()[2:4]))
+// SetCallbacks sets the callback functions for page management
+func (fl *FreeList) SetCallbacks(get func(uint64) []byte, new func([]byte) uint64, set func(uint64) []byte) {
+	fl.get = get
+	fl.new = new
+	fl.set = set
 }
 
-func flnNext(node btree.BNode) uint64 {
-	return binary.LittleEndian.Uint64(node.GetData()[12:20])
+/**
+* Sequence numbers
+* ----------------------------
+* Sequence number (`headSeq`, `tailSeq`) indexes into head and tail nodes. A clever aspect of the design is using monotonically increasing sequence numbers
+* They provide a unique identifier for each position in the list. They make it easy to determine when a node is full or empty.
+ */
+
+// Convert a sequence number to an index within a node
+func seq2idx(seq uint64) int {
+	return int(seq % uint64(constants.FreeListCap))
 }
 
-func flnPtr(node btree.BNode, idx int) uint64 {
-	util.Assert(idx < flnSize(node), ErrIndexOutOfBound)
-	pos := constants.FreeListHeader + 8*idx
-	return binary.LittleEndian.Uint64(node.GetData()[pos:])
+/**
+* During an update transaction, the free list is both
+* - Added to (when pages are freed)
+* - Removed from (when pages are needed)
+ */
+
+// make the newly added items available for consumption
+func (fl *FreeList) SetMaxSeq() {
+	fl.maxSeq = fl.tailSeq
 }
 
-func flnSetPtr(node btree.BNode, idx int, ptr uint64) {
-	util.Assert(idx < flnSize(node), ErrIndexOutOfBound)
-	pos := constants.FreeListHeader + 8*idx
-	binary.LittleEndian.PutUint64(node.GetData()[pos:], ptr)
-}
-
-func flnSetHeader(node btree.BNode, size uint16, next uint64) {
-	binary.LittleEndian.PutUint16(node.GetData()[2:4], size)
-	binary.LittleEndian.PutUint64(node.GetData()[12:20], next)
-}
-
-func flnSetTotal(node btree.BNode, total uint64) {
-	binary.LittleEndian.PutUint64(node.GetData()[4:12], total)
-}
-
-// number of items in the list
-func (fl *FreeList) Total() int {
-	if fl.head == 0 {
-		return 0
+// Consuming from the free list
+//
+// Remove 1 item from the head node, and remove the head node if empty
+func flPop(fl *FreeList) (ptr uint64, head uint64) {
+	if fl.headSeq == fl.maxSeq {
+		return 0, 0 // cannot advance
 	}
-	node := fl.get(fl.head)
-	return int(binary.LittleEndian.Uint64(node.GetData()[4:12]))
+	node := LNode(fl.get(fl.headPage))
+	ptr = node.getPtr(seq2idx(fl.headSeq)) // item
+	fl.headSeq++
+	// move to the next one if the head node is empty
+	if seq2idx(fl.headSeq) == 0 {
+		head, fl.headPage = fl.headPage, node.getNext()
+		util.Assert(fl.headPage != 0, "free list should never be empty")
+	}
+	return
 }
 
-// get the nth pointer
-func (fl *FreeList) Get(topn int) uint64 {
-	util.Assert(0 <= topn && topn < fl.Total(), "ERROR")
-	node := fl.get(fl.head)
-	for flnSize(node) <= topn {
-		topn -= flnSize(node)
-		next := flnNext(node)
-		util.Assert(next != 0, "ERROR")
-		node = fl.get(next)
+// get 1 item from the list head. return 0 on failure.
+func (fl *FreeList) PopHead() uint64 {
+	ptr, head := flPop(fl)
+	if head != 0 { // the empty head node is recycled
+		fl.PushTail(head)
 	}
-	return flnPtr(node, flnSize(node)-topn-1)
+	return ptr
 }
 
-// remove `popn` pointers and add some new pointers
-func (fl *FreeList) Update(popn int, freed []uint64) {
-	util.Assert(popn <= fl.Total(), "ERROR")
-	if popn == 0 && len(freed) == 0 {
-		return // nothing to do
-	}
-	// prepare to construct the new list
-	total := fl.Total()
-	reuse := []uint64{}
-	for fl.head != 0 && len(reuse)*constants.FreeListCap < len(freed) {
-		node := fl.get(fl.head)
-		freed = append(freed, fl.head) // recycle the node itself
-		if popn >= flnSize(node) {
-			// phase 1
-			// remove all pointers in this node
-			popn -= flnSize(node)
-		} else {
-			// phase 2:
-			// remove some pointers
-			remain := flnSize(node) - popn
-			popn = 0
-			// reuse pointers from the free list itself
-			for remain > 0 && len(reuse)*constants.FreeListCap < len(freed)+remain {
-				remain--
-				reuse = append(reuse, flnPtr(node, remain))
-			}
-			// move the node into the `freed` list
-			for i := 0; i < remain; i++ {
-				freed = append(freed, flnPtr(node, i))
-			}
+func (fl *FreeList) PushTail(ptr uint64) {
+	// add it to the tail node
+	LNode(fl.set(fl.tailPage)).setPtr(seq2idx(fl.tailSeq), ptr)
+	fl.tailSeq++
+	// add a new tail node if it's full (the list is never empty)
+	if seq2idx(fl.tailSeq) == 0 {
+		// try to reuse from the list head
+		next, head := flPop(fl) // may remove the head node
+		if next == 0 {
+			// or allocate a new node by appending
+			next = fl.new(make([]byte, constants.PageSize))
 		}
-		// discard the node and move to the next node
-		total -= flnSize(node)
-		fl.head = flnNext(node)
-	}
-	util.Assert(len(reuse)*constants.FreeListCap >= len(freed) || fl.head == 0, "ERROR")
-	// phase 3: prepend new nodes
-	flPush(fl, freed, reuse)
-	// done
-	flnSetTotal(fl.get(fl.head), uint64(total+len(freed)))
-}
-
-func flPush(fl *FreeList, freed []uint64, reuse []uint64) {
-	for len(freed) > 0 {
-		new := btree.NewBNode(make([]byte, constants.PageSize))
-		// construct a new node
-		size := len(freed)
-		if size > constants.FreeListCap {
-			size = constants.FreeListCap
-		}
-		flnSetHeader(new, uint16(size), fl.head)
-		for i, ptr := range freed[:size] {
-			flnSetPtr(new, i, ptr)
-		}
-		freed = freed[size:]
-		if len(reuse) > 0 {
-			// reuse a pointer from the list
-			fl.head, reuse = reuse[0], reuse[1:]
-			fl.use(fl.head, new)
-		} else {
-			// or append a page to house the new node
-			fl.head = fl.new(new)
+		// link to the new tail node
+		LNode(fl.set(fl.tailPage)).setNext(next)
+		fl.tailPage = next
+		// also add the head node if it's removed
+		if head != 0 {
+			LNode(fl.set(fl.tailPage)).setPtr(0, head)
+			fl.tailSeq++
 		}
 	}
-	util.Assert(len(reuse) == 0, "ERROR")
+}
+
+// Initialize a new free list
+func NewFreeList(get func(uint64) []byte, new func([]byte) uint64, set func(uint64) []byte) *FreeList {
+	fl := &FreeList{
+		get:      get,
+		new:      new,
+		set:      set,
+		headPage: 0,
+		headSeq:  0,
+		tailPage: 0,
+		tailSeq:  0,
+		maxSeq:   0,
+	}
+	return fl
 }
