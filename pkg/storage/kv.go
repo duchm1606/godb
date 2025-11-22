@@ -318,11 +318,22 @@ fail:
 func (db *KV) Get(key []byte) ([]byte, bool) {
 	return db.tree.Get(key)
 }
-func (db *KV) Set(key []byte, val []byte) error {
-	meta := saveMeta(db)
-	db.tree.Insert(key, val)
-	return updateOrRevert(db, meta)
+func (db *KV) Set(key []byte, val []byte) (bool, error) {
+	return db.Update(&btree.UpdateReq{
+		Key: key,
+		Val: val,
+	})
 }
+
+func (db *KV) Update(req *btree.UpdateReq) (bool, error) {
+	meta := saveMeta(db)
+	if !db.tree.Update(req) {
+		return false, nil
+	}
+	err := updateOrRevert(db, meta)
+	return err == nil, err
+}
+
 func (db *KV) Del(key []byte) (bool, error) {
 	meta := saveMeta(db)
 	if !db.tree.Delete(key) {
