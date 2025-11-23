@@ -6,31 +6,33 @@ import (
 )
 
 // / delete a key from the tree
-func treeDelete(tree *BTree, node BNode, key []byte) BNode {
+func treeDelete(req *DeleteReq, node BNode) BNode {
 	// where to find the key?
-	idx := nodeLookupLE(node, key)
+	idx := nodeLookupLE(node, req.Key)
 	// act depending on the node type
 	switch node.btype() {
 	case BNODE_LEAF:
-		if !bytes.Equal(key, node.getKey(idx)) {
+		if !bytes.Equal(req.Key, node.getKey(idx)) {
 			return BNode{} // not found
 		}
 		// delete the key in the leaf
+		req.Old = node.getVal(idx)
 		new := BNode(make([]byte, BTREE_PAGE_SIZE))
 		leafDelete(new, node, idx)
 		return new
 	case BNODE_NODE:
-		return nodeDelete(tree, node, idx, key)
+		return nodeDelete(req, node, idx)
 	default:
 		panic("bad node!")
 	}
 }
 
 // part of the treeDelete()
-func nodeDelete(tree *BTree, node BNode, idx uint16, key []byte) BNode {
+func nodeDelete(req *DeleteReq, node BNode, idx uint16) BNode {
+	tree := req.Tree
 	// recurse into the kid
 	kptr := node.getPtr(idx)
-	updated := treeDelete(tree, tree.get(kptr), key)
+	updated := treeDelete(req, tree.get(kptr))
 	if len(updated) == 0 {
 		return BNode{} // not found
 	}
@@ -51,8 +53,8 @@ func nodeDelete(tree *BTree, node BNode, idx uint16, key []byte) BNode {
 		tree.del(node.getPtr(idx + 1))
 		nodeReplace2Kid(new, node, idx, tree.new(merged), merged.getKey(0))
 	case mergeDir == 0 && updated.nkeys() == 0:
-		util.Assert(node.nkeys() == 1 && idx == 0, "nodeDelete: 1 empty child but no sibling")
-		new.setHeader(BNODE_NODE, 0) // the parent becomes empty too
+		util.Assert(node.nkeys() == 1 && idx == 0, "nodeDelete: 1 empty child but no sibling") // 1 empty child but no sibling
+		new.setHeader(BNODE_NODE, 0)                                                           // the parent becomes empty too
 	case mergeDir == 0 && updated.nkeys() > 0: // no merge
 		nodeReplaceKidN(tree, new, node, idx, updated)
 	}

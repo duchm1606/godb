@@ -55,6 +55,14 @@ type BTree struct {
 	del func(uint64)        // deallocate a page
 }
 
+type DeleteReq struct {
+	Tree *BTree
+	// in
+	Key []byte
+	// out
+	Old []byte
+}
+
 func (tree *BTree) SetRoot(root uint64) {
 	tree.root = root
 }
@@ -72,14 +80,14 @@ func (tree *BTree) SetCallbacks(get func(uint64) []byte, new func([]byte) uint64
 
 // Interfaces
 
-func (tree *BTree) Delete(key []byte) bool {
-	util.Assert(len(key) != 0, "Delete: key is empty")
-	util.Assert(len(key) <= BTREE_MAX_KEY_SIZE, "Delete: key is too long")
+func (tree *BTree) Delete(req *DeleteReq) bool {
+	util.Assert(len(req.Key) != 0, "Delete: key is empty")
+	util.Assert(len(req.Key) <= BTREE_MAX_KEY_SIZE, "Delete: key is too long")
 	if tree.root == 0 {
 		return false
 	}
 
-	updated := treeDelete(tree, tree.get(tree.root), key)
+	updated := treeDelete(req, tree.get(tree.root))
 	if len(updated) == 0 {
 		return false // not found
 	}

@@ -8,6 +8,7 @@ import (
 	"godb/internal/util"
 	"godb/pkg/btree"
 	"godb/pkg/storage"
+	"slices"
 )
 
 // DB is a wrapper of KV
@@ -20,17 +21,19 @@ type DB struct {
 
 type TableDef struct {
 	// user defined
-	Name  string
-	Types []uint32 // column types
-	Cols  []string // column names
-	PKeys int      // the first `PKeys` columns are the primary key
+	Name    string
+	Types   []uint32   // column types
+	Cols    []string   // column names
+	Indexes [][]string // the first index is the primary key
 	// auto-assigned B-tree key prefixes for different tables
-	Prefix uint32
+	Prefixes []uint32
 }
 
 const (
-	TYPE_BYTES = 1 // string (of arbitrary bytes)
-	TYPE_INT64 = 2 // integer; 64-bit signed
+	TYPE_ERROR = 0    // uninitialized
+	TYPE_BYTES = 1    // string (of arbitrary bytes)
+	TYPE_INT64 = 2    // integer; 64-bit signed
+	TYPE_INF   = 0xff // do not use
 )
 
 // table cell
@@ -75,20 +78,20 @@ func (rec *Record) Get(key string) *Value {
 // primary key (`name`)
 // )
 var TDEF_TABLE = &TableDef{
-	Prefix: 2,
-	Name:   "@table",
-	Types:  []uint32{TYPE_BYTES, TYPE_BYTES},
-	Cols:   []string{"name", "def"},
-	PKeys:  1,
+	Prefixes: []uint32{2},
+	Name:     "@table",
+	Types:    []uint32{TYPE_BYTES, TYPE_BYTES},
+	Cols:     []string{"name", "def"},
+	Indexes:  [][]string{{"name"}},
 }
 
 // internal table: table schemas
 var TDEF_META = &TableDef{
-	Prefix: 1,
-	Name:   "@meta",
-	Types:  []uint32{TYPE_BYTES, TYPE_BYTES},
-	Cols:   []string{"key", "val"},
-	PKeys:  1,
+	Prefixes: []uint32{1},
+	Name:     "@meta",
+	Types:    []uint32{TYPE_BYTES, TYPE_BYTES},
+	Cols:     []string{"key", "val"},
+	Indexes:  [][]string{{"key"}},
 }
 
 var INTERNAL_TABLES map[string]*TableDef = map[string]*TableDef{
@@ -97,51 +100,6 @@ var INTERNAL_TABLES map[string]*TableDef = map[string]*TableDef{
 }
 
 // DB operations
-
-// Query by primary key
-
-// rearrange a record to the defined column order
-func reorderRecord(tdef *TableDef, rec Record) ([]Value, error) {
-	util.Assert(len(rec.Cols) == len(rec.Vals), "reorderRecord: record columns and values mismatch")
-	out := make([]Value, len(tdef.Cols))
-	for i, c := range tdef.Cols {
-		v := rec.Get(c)
-		if v == nil {
-			continue // leave this column uninitialized
-		}
-		if v.Type != tdef.Types[i] {
-			return nil, fmt.Errorf("bad column type: %s", c)
-		}
-		out[i] = *v
-	}
-	return out, nil
-}
-
-func valuesComplete(tdef *TableDef, vals []Value, n int) error {
-	for i, v := range vals {
-		if i < n && v.Type == 0 {
-			return fmt.Errorf("missing column: %s", tdef.Cols[i])
-		} else if i >= n && v.Type != 0 {
-			return fmt.Errorf("extra column: %s", tdef.Cols[i])
-		}
-	}
-	return nil
-}
-
-// reorder a record and check for missing columns.
-// n == tdef.PKeys: record is exactly a primary key
-// n == len(tdef.Cols): record contains all columns
-func checkRecord(tdef *TableDef, rec Record, n int) ([]Value, error) {
-	vals, err := reorderRecord(tdef, rec)
-	if err != nil {
-		return nil, err
-	}
-	err = valuesComplete(tdef, vals, n)
-	if err != nil {
-		return nil, err
-	}
-	return vals, nil
-}
 
 // escape the null byte so that the string contains no null byte.
 func escapeString(in []byte) []byte {
@@ -207,6 +165,16 @@ func encodeValues(out []byte, vals []Value) []byte {
 	return out
 }
 
+func encodeKeyPartial(
+	out []byte, prefix uint32, vals []Value, cmp int,
+) []byte {
+	out = encodeKey(out, prefix, vals)
+	if cmp == btree.CMP_GT || cmp == btree.CMP_LE { // encode missing columns as infinity
+		out = append(out, 0xff) // unreachable +infinity
+	} // else: -infinity is the empty string
+	return out
+}
+
 // encode columns for the "key" of the KV
 func encodeKey(out []byte, prefix uint32, vals []Value) []byte {
 	// 4-byte table prefix
@@ -238,27 +206,40 @@ func decodeValues(in []byte, out []Value) {
 	util.Assert(len(in) == 0, "decodeValues: extra data")
 }
 
+// extract multiple column values
+func getValues(tdef *TableDef, rec Record, cols []string) ([]Value, error) {
+	vals := make([]Value, len(cols))
+	for i, c := range cols {
+		v := rec.Get(c)
+		if v == nil {
+			return nil, fmt.Errorf("missing column: %s", tdef.Cols[i])
+		}
+		if v.Type != tdef.Types[slices.Index(tdef.Cols, c)] {
+			return nil, fmt.Errorf("bad column type: %s", c)
+		}
+		vals[i] = *v
+	}
+	return vals, nil
+}
+
 // get a single row by the primary key
 func dbGet(db *DB, tdef *TableDef, rec *Record) (bool, error) {
 	// 1. reorder the input columns according to the schema
-	values, err := checkRecord(tdef, *rec, tdef.PKeys)
+	values, err := getValues(tdef, *rec, tdef.Indexes[0])
 	if err != nil {
+		return false, err // not a primary key
+	}
+	// just a shortcut for the scan operation
+	sc := Scanner{
+		Cmp1: btree.CMP_GE,
+		Cmp2: btree.CMP_LE,
+		Key1: Record{tdef.Indexes[0], values},
+		Key2: Record{tdef.Indexes[0], values},
+	}
+	if err := dbScan(db, tdef, &sc); err != nil || !sc.Valid() {
 		return false, err
 	}
-	// 2. encode the primary key
-	key := encodeKey(nil, tdef.Prefix, values[:tdef.PKeys])
-	// 3. query the KV store
-	val, ok := db.kv.Get(key)
-	if !ok {
-		return false, nil
-	}
-	// 4. decode the value into columns
-	for i := tdef.PKeys; i < len(tdef.Cols); i++ {
-		values[i].Type = tdef.Types[i]
-	}
-	decodeValues(val, values[tdef.PKeys:])
-	rec.Cols = tdef.Cols
-	rec.Vals = values
+	sc.Deref(rec)
 	return true, nil
 }
 
@@ -292,13 +273,45 @@ func getTableDefDB(db *DB, name string) *TableDef {
 
 const TABLE_PREFIX_MIN = 100
 
+func checkIndexCols(tdef *TableDef, index []string) ([]string, error) {
+	if len(index) == 0 {
+		return nil, fmt.Errorf("empty index")
+	}
+	seen := map[string]bool{}
+	for _, c := range index {
+		// check the index columns
+		if slices.Index(tdef.Cols, c) < 0 {
+			return nil, fmt.Errorf("unknown index column: %s", c)
+		}
+		if seen[c] {
+			return nil, fmt.Errorf("duplicated column in index: %s", c)
+		}
+		seen[c] = true
+	}
+	// add the primary key to the index
+	for _, c := range tdef.Indexes[0] {
+		if !seen[c] {
+			index = append(index, c)
+		}
+	}
+	util.Assert(len(index) <= len(tdef.Cols), "checkIndexCols: index columns exceed the table columns")
+	return index, nil
+}
+
 func tableDefCheck(tdef *TableDef) error {
 	// verify the table schema
-	bad := tdef.Name == "" || len(tdef.Cols) == 0 ||
-		len(tdef.Cols) != len(tdef.Types) ||
-		!(1 <= tdef.PKeys && int(tdef.PKeys) <= len(tdef.Cols))
+	bad := tdef.Name == "" || len(tdef.Cols) == 0 || len(tdef.Indexes) == 0 ||
+		len(tdef.Cols) != len(tdef.Types)
 	if bad {
 		return fmt.Errorf("bad table schema: %s", tdef.Name)
+	}
+	// verify the indexes
+	for i, index := range tdef.Indexes {
+		index, err := checkIndexCols(tdef, index)
+		if err != nil {
+			return err
+		}
+		tdef.Indexes[i] = index
 	}
 	return nil
 }
@@ -316,20 +329,24 @@ func (db *DB) TableNew(tdef *TableDef) error {
 		return fmt.Errorf("table exists: %s", tdef.Name)
 	}
 	// 2. allocate a new prefix
-	util.Assert(tdef.Prefix == 0, "TableNew: table prefix is not 0")
-	tdef.Prefix = TABLE_PREFIX_MIN
+	prefix := uint32(TABLE_PREFIX_MIN)
 	meta := (&Record{}).AddStr("key", []byte("next_prefix"))
 	ok, err = dbGet(db, TDEF_META, meta)
 	util.Assert(err == nil, "TableNew: failed to get next prefix")
 	if ok {
-		tdef.Prefix = binary.LittleEndian.Uint32(meta.Get("val").Str)
-		util.Assert(tdef.Prefix > TABLE_PREFIX_MIN, "TableNew: next prefix is less than TABLE_PREFIX_MIN")
+		prefix = binary.LittleEndian.Uint32(meta.Get("val").Str)
+		util.Assert(prefix > TABLE_PREFIX_MIN, "TableNew: next prefix is less than TABLE_PREFIX_MIN")
 	} else {
 		meta.AddStr("val", make([]byte, 4))
 	}
+	util.Assert(len(tdef.Prefixes) == 0, "TableNew: prefixes are already set")
+	for i := range tdef.Indexes {
+		tdef.Prefixes = append(tdef.Prefixes, prefix+uint32(i))
+	}
 	// 3. update the next prefix
 	// FIXME: integer overflow.
-	binary.LittleEndian.PutUint32(meta.Get("val").Str, tdef.Prefix+1)
+	next := prefix + uint32(len(tdef.Indexes))
+	binary.LittleEndian.PutUint32(meta.Get("val").Str, next)
 	_, err = dbUpdate(db, TDEF_META, &DBUpdateReq{Record: *meta})
 	if err != nil {
 		return err
@@ -362,19 +379,80 @@ func (db *DB) Get(table string, rec *Record) (bool, error) {
 
 // add a row to the table
 func dbUpdate(db *DB, tdef *TableDef, dbreq *DBUpdateReq) (bool, error) {
-	values, err := checkRecord(tdef, dbreq.Record, len(tdef.Cols))
+	// reorder the columns so that they start with the primary key
+	cols := slices.Concat(tdef.Indexes[0], nonPrimaryKeyCols(tdef))
+	values, err := getValues(tdef, dbreq.Record, cols)
 	if err != nil {
-		return false, err
+		return false, err // expect a full row
 	}
 
-	key := encodeKey(nil, tdef.Prefix, values[:tdef.PKeys])
-	val := encodeValues(nil, values[tdef.PKeys:])
+	// insert the row
+	npk := len(tdef.Indexes[0]) // number of primary key columns
+	key := encodeKey(nil, tdef.Prefixes[0], values[:npk])
+	val := encodeValues(nil, values[npk:])
 	req := btree.UpdateReq{Key: key, Val: val, Mode: dbreq.Mode}
 	if _, err = db.kv.Update(&req); err != nil {
 		return false, err
 	}
 	dbreq.Added, dbreq.Updated = req.Added, req.Updated
+
+	// maintain secondary indexes
+	if req.Updated && !req.Added {
+		// construct the old record
+		decodeValues(req.Old, values[npk:])
+		oldRec := Record{cols, values}
+		// delete the indexed keys
+		if err = indexOp(db, tdef, INDEX_DEL, oldRec); err != nil {
+			return false, err // TODO: revert previous updates
+		}
+	}
+	if req.Updated {
+		// add the new indexed keys
+		if err = indexOp(db, tdef, INDEX_ADD, dbreq.Record); err != nil {
+			return false, err // TODO: revert previous updates
+		}
+	}
 	return req.Updated, nil
+}
+
+func nonPrimaryKeyCols(tdef *TableDef) (out []string) {
+	for _, c := range tdef.Cols {
+		if slices.Index(tdef.Indexes[0], c) < 0 {
+			out = append(out, c)
+		}
+	}
+	return
+}
+
+const (
+	INDEX_ADD = 1
+	INDEX_DEL = 2
+)
+
+// add or remove secondary index keys
+func indexOp(db *DB, tdef *TableDef, op int, rec Record) error {
+	for i := 1; i < len(tdef.Indexes); i++ {
+		// the indexed key
+		values, err := getValues(tdef, rec, tdef.Indexes[i])
+		util.Assert(err == nil, "indexOp: full row") // full row
+		key := encodeKey(nil, tdef.Prefixes[i], values)
+		switch op {
+		case INDEX_ADD:
+			req := btree.UpdateReq{Key: key, Val: nil}
+			_, err = db.kv.Update(&req)
+			util.Assert(req.Added, "indexOp: internal consistency") // internal consistency
+		case INDEX_DEL:
+			deleted := false
+			deleted, err = db.kv.Del(&btree.DeleteReq{Key: key})
+			util.Assert(deleted, "indexOp: internal consistency") // internal consistency
+		default:
+			panic("unreachable")
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // add a record
@@ -400,13 +478,30 @@ func (db *DB) Upsert(table string, rec Record) (bool, error) {
 
 // delete a record by its primary key
 func dbDelete(db *DB, tdef *TableDef, rec Record) (bool, error) {
-	values, err := checkRecord(tdef, rec, tdef.PKeys)
+	values, err := getValues(tdef, rec, tdef.Indexes[0])
 	if err != nil {
 		return false, err
 	}
-
-	key := encodeKey(nil, tdef.Prefix, values[:tdef.PKeys])
-	return db.kv.Del(key)
+	// delete the row
+	key := encodeKey(nil, tdef.Prefixes[0], values)
+	req := btree.DeleteReq{Key: key}
+	deleted, err := db.kv.Del(&req)
+	if err != nil {
+		return false, err
+	}
+	// maintain secondary indexes
+	if deleted {
+		for _, c := range nonPrimaryKeyCols(tdef) {
+			tp := tdef.Types[slices.Index(tdef.Cols, c)]
+			values = append(values, Value{Type: tp})
+		}
+		decodeValues(req.Old, values[len(tdef.Indexes[0]):])
+		old := Record{tdef.Cols, values}
+		if err = indexOp(db, tdef, INDEX_DEL, old); err != nil {
+			return false, err // TODO: revert previous updates
+		}
+	}
+	return deleted, nil
 }
 
 func (db *DB) Delete(table string, rec Record) (bool, error) {
