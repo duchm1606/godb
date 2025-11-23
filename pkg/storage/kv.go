@@ -33,7 +33,7 @@ type KV struct {
 		// nil value denotes a deallocated page.
 		updates map[uint64][]byte // pending updates, including appended pages
 	}
-	tree btree.BTree
+	Tree btree.BTree
 	free FreeList
 
 	failed bool // Did the last update fail?
@@ -102,7 +102,7 @@ the 1st page stores the root pointer and other auxiliary data.
 | 16B |    8B    |     8B    |     8B    |    8B    |     8B    |    8B    |
 */
 func loadMeta(db *KV, data []byte) {
-	db.tree.SetRoot(binary.LittleEndian.Uint64(data[16:24]))
+	db.Tree.SetRoot(binary.LittleEndian.Uint64(data[16:24]))
 	db.page.flushed = binary.LittleEndian.Uint64(data[24:32])
 	db.free.headPage = binary.LittleEndian.Uint64(data[32:40])
 	db.free.headSeq = binary.LittleEndian.Uint64(data[40:48])
@@ -113,7 +113,7 @@ func loadMeta(db *KV, data []byte) {
 func saveMeta(db *KV) []byte {
 	var data [64]byte
 	copy(data[:16], []byte(DB_SIG))
-	binary.LittleEndian.PutUint64(data[16:24], db.tree.GetRoot())
+	binary.LittleEndian.PutUint64(data[16:24], db.Tree.GetRoot())
 	binary.LittleEndian.PutUint64(data[24:32], db.page.flushed)
 	binary.LittleEndian.PutUint64(data[32:40], db.free.headPage)
 	binary.LittleEndian.PutUint64(data[40:48], db.free.headSeq)
@@ -144,7 +144,7 @@ func readRoot(db *KV, fileSize int64) error {
 	// pointers are within range?
 	maxpages := uint64(fileSize / constants.PageSize)
 	bad = bad || !(0 < db.page.flushed && db.page.flushed <= maxpages)
-	bad = bad || !(0 < db.tree.GetRoot() && db.tree.GetRoot() < db.page.flushed)
+	bad = bad || !(0 < db.Tree.GetRoot() && db.Tree.GetRoot() < db.page.flushed)
 	bad = bad || !(0 < db.free.headPage && db.free.headPage < db.page.flushed)
 	bad = bad || !(0 < db.free.tailPage && db.free.tailPage < db.page.flushed)
 	if bad {
@@ -288,7 +288,7 @@ func (db *KV) Open() error {
 	var err error
 	db.page.updates = map[uint64][]byte{}
 	// B+tree callbacks
-	db.tree.SetCallbacks(db.pageRead, db.pageAlloc, db.free.PushTail)
+	db.Tree.SetCallbacks(db.pageRead, db.pageAlloc, db.free.PushTail)
 	// free list callbacks
 	db.free.SetCallbacks(db.pageRead, db.pageAppend, db.pageWrite)
 	// open or create the DB file
@@ -316,7 +316,7 @@ fail:
 }
 
 func (db *KV) Get(key []byte) ([]byte, bool) {
-	return db.tree.Get(key)
+	return db.Tree.Get(key)
 }
 func (db *KV) Set(key []byte, val []byte) (bool, error) {
 	return db.Update(&btree.UpdateReq{
@@ -327,7 +327,7 @@ func (db *KV) Set(key []byte, val []byte) (bool, error) {
 
 func (db *KV) Update(req *btree.UpdateReq) (bool, error) {
 	meta := saveMeta(db)
-	if !db.tree.Update(req) {
+	if !db.Tree.Update(req) {
 		return false, nil
 	}
 	err := updateOrRevert(db, meta)
@@ -336,7 +336,7 @@ func (db *KV) Update(req *btree.UpdateReq) (bool, error) {
 
 func (db *KV) Del(key []byte) (bool, error) {
 	meta := saveMeta(db)
-	if !db.tree.Delete(key) {
+	if !db.Tree.Delete(key) {
 		return false, nil
 	}
 	err := updateOrRevert(db, meta)

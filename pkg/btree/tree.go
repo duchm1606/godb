@@ -28,6 +28,13 @@ const (
 	MODE_INSERT_ONLY = 2 // only add new keys
 )
 
+const (
+	CMP_GE = +3 // >=
+	CMP_GT = +2 // >
+	CMP_LT = -2 // <
+	CMP_LE = -3 // <=
+)
+
 type UpdateReq struct {
 	tree *BTree
 	// out
@@ -150,4 +157,21 @@ func (tree *BTree) Update(req *UpdateReq) bool {
 		tree.root = tree.new(split[0])
 	}
 	return true
+}
+
+// key cmp ref
+func CmpOK(key []byte, cmp int, ref []byte) bool {
+	r := bytes.Compare(key, ref)
+	switch cmp {
+	case CMP_GE:
+		return r >= 0
+	case CMP_GT:
+		return r > 0
+	case CMP_LT:
+		return r < 0
+	case CMP_LE:
+		return r <= 0
+	default:
+		panic("what?")
+	}
 }
