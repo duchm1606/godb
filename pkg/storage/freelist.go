@@ -58,6 +58,14 @@ func (fl *FreeList) SetCallbacks(get func(uint64) []byte, new func([]byte) uint6
 	fl.set = set
 }
 
+/**
+* Sequence numbers
+* ----------------------------
+* Sequence number (`headSeq`, `tailSeq`) indexes into head and tail nodes. A clever aspect of the design is using monotonically increasing sequence numbers
+* They provide a unique identifier for each position in the list. They make it easy to determine when a node is full or empty.
+ */
+
+// Convert a sequence number to an index within a node
 func seq2idx(seq uint64) int {
 	return int(seq % uint64(constants.FreeListCap))
 }
