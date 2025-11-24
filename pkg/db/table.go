@@ -19,6 +19,23 @@ type DB struct {
 	tables map[string]*TableDef // cached table schemas
 }
 
+// DB transaction
+type DBTX struct {
+	kv storage.KVTX
+	db *DB
+}
+
+func (db *DB) Begin(tx *DBTX) {
+	tx.db = db
+	db.kv.Begin(&tx.kv)
+}
+func (db *DB) Commit(tx *DBTX) error {
+	return db.kv.Commit(&tx.kv)
+}
+func (db *DB) Abort(tx *DBTX) {
+	db.kv.Abort(&tx.kv)
+}
+
 type TableDef struct {
 	// user defined
 	Name    string
