@@ -17,12 +17,12 @@ const (
 
 // Free List Configuration
 const (
-	// FreeListHeader is the size of the free list node header.
-	FreeListHeader = 4 + 8 + 8
+	// FreeListHeader is the size of the free list node header (next pointer).
+	FreeListHeader = 8
 )
 
 // Calculated constants
 var (
-	// FreeListCap is the maximum number of pointers in a free list node.
-	FreeListCap = (PageSize - FreeListHeader) / 8
+	// FreeListCap is the maximum number of (pointer,version) pairs in a free list node.
+	FreeListCap = (PageSize - FreeListHeader) / 16
 )

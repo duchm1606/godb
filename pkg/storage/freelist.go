@@ -6,20 +6,9 @@ import (
 	"godb/internal/util"
 )
 
-const FREE_LIST_HEADER = 8
-
-/*
-Present a free list node
-
-Each node starts with a pointer to the next node.
-Items are appended next to it.
-
-Node format:
-
-| next | pointers | unused |
-
-| 8B | n*8B | ... |
-*/
+// layout:
+// | next | pointer + version | unused |
+// |  8B  |      16B * N      |   ...   |
 type LNode []byte
 
 func (node LNode) getNext() uint64 {
@@ -30,13 +19,17 @@ func (node LNode) setNext(next uint64) {
 	binary.LittleEndian.PutUint64(node[:8], next)
 }
 
-func (node LNode) getPtr(idx int) uint64 {
-	offset := FREE_LIST_HEADER + 8*idx
-	return binary.LittleEndian.Uint64(node[offset:])
+func (node LNode) getItem(idx int) (ptr uint64, version uint64) {
+	offset := constants.FreeListHeader + 16*idx
+	return binary.LittleEndian.Uint64(node[offset:]),
+		binary.LittleEndian.Uint64(node[offset+8:])
 }
-func (node LNode) setPtr(idx int, ptr uint64) {
-	offset := FREE_LIST_HEADER + 8*idx
+
+func (node LNode) setItem(idx int, ptr uint64, version uint64) {
+	util.Assert(idx < constants.FreeListCap, "FreeList: index out of range")
+	offset := constants.FreeListHeader + 16*idx
 	binary.LittleEndian.PutUint64(node[offset:], ptr)
+	binary.LittleEndian.PutUint64(node[offset+8:], version)
 }
 
 // FreeList manages unused pages
@@ -46,14 +39,16 @@ type FreeList struct {
 	new func([]byte) uint64 // append a new page
 	set func(uint64) []byte // update an existing page
 
-	// persited data in the meta page
+	// persisted data in the meta page
 	headPage uint64 // pointer to the list head node
 	headSeq  uint64 // monotonic sequence number to index into the list head
 	tailPage uint64
 	tailSeq  uint64
 
 	// in-memory states
-	maxSeq uint64 // save `tailSeq` to prevent consuming newly added items
+	maxSeq uint64 // saved `tailSeq` to prevent consuming newly added items
+	maxVer uint64 // the oldest reader version
+	curVer uint64 // version number when committing
 }
 
 // SetCallbacks sets the callback functions for page management
@@ -63,43 +58,31 @@ func (fl *FreeList) SetCallbacks(get func(uint64) []byte, new func([]byte) uint6
 	fl.set = set
 }
 
-/**
-* Sequence numbers
-* ----------------------------
-* Sequence number (`headSeq`, `tailSeq`) indexes into head and tail nodes. A clever aspect of the design is using monotonically increasing sequence numbers
-* They provide a unique identifier for each position in the list. They make it easy to determine when a node is full or empty.
- */
-
-// Convert a sequence number to an index within a node
 func seq2idx(seq uint64) int {
 	return int(seq % uint64(constants.FreeListCap))
 }
 
-/**
-* During an update transaction, the free list is both
-* - Added to (when pages are freed)
-* - Removed from (when pages are needed)
- */
-
-// make the newly added items available for consumption
-func (fl *FreeList) SetMaxSeq() {
-	fl.maxSeq = fl.tailSeq
+func (fl *FreeList) check() {
+	util.Assert(fl.headPage != 0 && fl.tailPage != 0, "FreeList: empty list")
+	util.Assert(fl.headSeq == fl.tailSeq || fl.headPage != 0, "FreeList: inconsistent state")
 }
 
-// Consuming from the free list
-//
-// Remove 1 item from the head node, and remove the head node if empty
+// remove 1 item from the head node, and remove the head node if empty.
 func flPop(fl *FreeList) (ptr uint64, head uint64) {
+	fl.check()
 	if fl.headSeq == fl.maxSeq {
-		return 0, 0 // cannot advance
+		return 0, 0 // cannot advance; empty list or the current version
 	}
 	node := LNode(fl.get(fl.headPage))
-	ptr = node.getPtr(seq2idx(fl.headSeq)) // item
+	ptr, version := node.getItem(seq2idx(fl.headSeq))
+	if versionBefore(fl.maxVer, version) {
+		return 0, 0 // cannot advance; still in-use
+	}
 	fl.headSeq++
 	// move to the next one if the head node is empty
 	if seq2idx(fl.headSeq) == 0 {
 		head, fl.headPage = fl.headPage, node.getNext()
-		util.Assert(fl.headPage != 0, "free list should never be empty")
+		util.Assert(fl.headPage != 0, "FreeList: missing next node")
 	}
 	return
 }
@@ -114,8 +97,9 @@ func (fl *FreeList) PopHead() uint64 {
 }
 
 func (fl *FreeList) PushTail(ptr uint64) {
+	fl.check()
 	// add it to the tail node
-	LNode(fl.set(fl.tailPage)).setPtr(seq2idx(fl.tailSeq), ptr)
+	LNode(fl.set(fl.tailPage)).setItem(seq2idx(fl.tailSeq), ptr, fl.curVer)
 	fl.tailSeq++
 	// add a new tail node if it's full (the list is never empty)
 	if seq2idx(fl.tailSeq) == 0 {
@@ -130,15 +114,21 @@ func (fl *FreeList) PushTail(ptr uint64) {
 		fl.tailPage = next
 		// also add the head node if it's removed
 		if head != 0 {
-			LNode(fl.set(fl.tailPage)).setPtr(0, head)
+			LNode(fl.set(fl.tailPage)).setItem(0, head, fl.curVer)
 			fl.tailSeq++
 		}
 	}
 }
 
+// make the newly added items available for consumption
+func (fl *FreeList) SetMaxVer(maxVer uint64) {
+	fl.maxSeq = fl.tailSeq
+	fl.maxVer = maxVer
+}
+
 // Initialize a new free list
 func NewFreeList(get func(uint64) []byte, new func([]byte) uint64, set func(uint64) []byte) *FreeList {
-	fl := &FreeList{
+	return &FreeList{
 		get:      get,
 		new:      new,
 		set:      set,
@@ -147,6 +137,7 @@ func NewFreeList(get func(uint64) []byte, new func([]byte) uint64, set func(uint
 		tailPage: 0,
 		tailSeq:  0,
 		maxSeq:   0,
+		maxVer:   0,
+		curVer:   0,
 	}
-	return fl
 }

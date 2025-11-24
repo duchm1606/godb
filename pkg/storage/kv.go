@@ -10,6 +10,7 @@ import (
 	"godb/pkg/btree"
 	"os"
 	"path"
+	"sync"
 	"syscall"
 )
 
@@ -37,6 +38,29 @@ type KV struct {
 	free FreeList
 
 	failed bool // Did the last update fail?
+	// concurrency control
+	mutex   sync.Mutex    // serialize TX methods
+	version uint64        // monotonic version number
+	ongoing []uint64      // version numbers of concurrent TXs
+	history []CommittedTX // chanages keys; for detecting conflicts
+}
+
+type CommittedTX struct {
+	version uint64
+	writes  []KeyRange // sorted
+}
+
+func mmapRead(ptr uint64, chunks [][]byte) []byte {
+	start := uint64(0)
+	for _, chunk := range chunks {
+		end := start + uint64(len(chunk))/constants.PageSize
+		if ptr < end {
+			offset := constants.PageSize * (ptr - start)
+			return chunk[offset : offset+constants.PageSize]
+		}
+		start = end
+	}
+	panic("bad ptr")
 }
 
 // `BTree.new`, allocate a new page.
@@ -98,8 +122,8 @@ func (db *KV) pageReadFile(ptr uint64) []byte {
 
 /*
 the 1st page stores the root pointer and other auxiliary data.
-| sig | root_ptr | page_used | head_page | head_seq | tail_page | tail_seq |
-| 16B |    8B    |     8B    |     8B    |    8B    |     8B    |    8B    |
+| sig | root_ptr | page_used | head_page | head_seq | tail_page | tail_seq | version |
+| 16B |    8B    |     8B    |     8B    |    8B    |     8B    |    8B    |    8B   |
 */
 func loadMeta(db *KV, data []byte) {
 	db.Tree.SetRoot(binary.LittleEndian.Uint64(data[16:24]))
@@ -108,10 +132,11 @@ func loadMeta(db *KV, data []byte) {
 	db.free.headSeq = binary.LittleEndian.Uint64(data[40:48])
 	db.free.tailPage = binary.LittleEndian.Uint64(data[48:56])
 	db.free.tailSeq = binary.LittleEndian.Uint64(data[56:64])
+	db.version = binary.LittleEndian.Uint64(data[64:72])
 }
 
 func saveMeta(db *KV) []byte {
-	var data [64]byte
+	var data [72]byte
 	copy(data[:16], []byte(DB_SIG))
 	binary.LittleEndian.PutUint64(data[16:24], db.Tree.GetRoot())
 	binary.LittleEndian.PutUint64(data[24:32], db.page.flushed)
@@ -119,6 +144,7 @@ func saveMeta(db *KV) []byte {
 	binary.LittleEndian.PutUint64(data[40:48], db.free.headSeq)
 	binary.LittleEndian.PutUint64(data[48:56], db.free.tailPage)
 	binary.LittleEndian.PutUint64(data[56:64], db.free.tailSeq)
+	binary.LittleEndian.PutUint64(data[64:72], db.version)
 	return data[:]
 }
 
@@ -132,13 +158,15 @@ func readRoot(db *KV, fileSize int64) error {
 		// add an initial node to the free list so it's never empty
 		db.free.headPage = 1 // the 2nd page
 		db.free.tailPage = 1
+		db.version = 0
+		db.free.SetMaxVer(db.version)
 		return nil // the meta page will be written in the 1st update
 	}
 	// read the page
 	data := db.mmap.chunks[0]
 	loadMeta(db, data)
 	// initialize the free list
-	db.free.SetMaxSeq()
+	db.free.SetMaxVer(db.version)
 	// verify the page
 	bad := !bytes.Equal([]byte(DB_SIG), data[:16])
 	// pointers are within range?
@@ -200,8 +228,6 @@ func updateFile(db *KV) error {
 	if err := db.Fsync(db.fd); err != nil {
 		return err
 	}
-	// prepare the free list for the next update
-	db.free.SetMaxSeq()
 	return nil
 }
 

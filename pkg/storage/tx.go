@@ -1,62 +1,343 @@
 package storage
 
 import (
+	"bytes"
+	"errors"
 	"godb/internal/util"
 	"godb/pkg/btree"
 	"runtime"
+	"slices"
 )
 
-type KVTX struct {
-	db   *KV
-	meta []byte // for the rollback
-	root uint64 // the saved root pointer for skipping empty transactions
-	done bool   // check misuses
+// start <= key <= stop
+type KeyRange struct {
+	start []byte
+	stop  []byte
 }
+
+type KVTX struct {
+	// a read-only snapshot
+	snapshot btree.BTree
+	version  uint64
+	// captured KV updates:
+	// values are prefixed by a 1-byte flag to indicate deleted keys.
+	pending btree.BTree
+	// a list of involved intervals of keys for detecting conflicts
+	reads []KeyRange
+	// should check for conflicts even if an update changes nothing
+	updateAttempted bool
+	// check misuses
+	done bool
+}
+
+// a < b
+func versionBefore(a, b uint64) bool {
+	return a-b > 1<<63 // this works even after wraparounds
+}
+
+// a prefix for values in KVTX.pending
+const (
+	FLAG_DELETED = byte(1)
+	FLAG_UPDATED = byte(2)
+)
 
 // begin a transaction
 func (kv *KV) Begin(tx *KVTX) {
-	tx.db = kv
-	tx.meta = saveMeta(tx.db)
-	tx.root = tx.db.Tree.GetRoot()
-	util.Assert(kv.page.nappend == 0 && len(kv.page.updates) == 0, "KV.Begin: page.nappend or page.updates is not empty")
-	// XXX: sanity check; unreliable
+	kv.mutex.Lock()
+	defer kv.mutex.Unlock()
+	// read-only snapshot, just the tree root and the page read callback
+	tx.snapshot.SetRoot(kv.Tree.GetRoot())
+	chunks := kv.mmap.chunks // copied to avoid updates from writers
+	tx.snapshot.SetCallbacks(func(ptr uint64) []byte { return mmapRead(ptr, chunks) }, nil, nil)
+	tx.version = kv.version
+	// in-memory tree to capture updates
+	pages := [][]byte(nil)
+	tx.pending.SetCallbacks(func(ptr uint64) []byte { return pages[ptr-1] }, func(node []byte) uint64 {
+		pages = append(pages, node)
+		return uint64(len(pages))
+	}, func(uint64) {})
+	// keep track of concurrent TXs
+	kv.ongoing = append(kv.ongoing, tx.version)
 	runtime.SetFinalizer(tx, func(tx *KVTX) { util.Assert(tx.done, "KV.Begin: transaction is not done") })
 }
+
+func sortedRangesOverlap(s1, s2 []KeyRange) bool {
+	for len(s1) > 0 && len(s2) > 0 {
+		if bytes.Compare(s1[0].stop, s2[0].start) < 0 {
+			s1 = s1[1:]
+		} else if bytes.Compare(s2[0].stop, s1[0].start) < 0 {
+			s2 = s2[1:]
+		} else {
+			return true
+		}
+	}
+	return false
+}
+
+func detectConflicts(kv *KV, tx *KVTX) bool {
+	// sort the dependency ranges for easier overlap detection
+	slices.SortFunc(tx.reads, func(r1, r2 KeyRange) int {
+		return bytes.Compare(r1.start, r2.start)
+	})
+	// do they overlap with newer versions?
+	for i := len(kv.history) - 1; i >= 0; i-- {
+		if !versionBefore(tx.version, kv.history[i].version) {
+			break // sorted
+		}
+		if sortedRangesOverlap(tx.reads, kv.history[i].writes) {
+			return true
+		}
+	}
+	return false
+}
+
+var ErrorConflict = errors.New("cannot commit due to conflict")
 
 // end a transaction: commit updates
 func (kv *KV) Commit(tx *KVTX) error {
 	util.Assert(!tx.done, "storage.KV.Commit: transaction is already done")
 	tx.done = true
-	if kv.Tree.GetRoot() == tx.root {
-		return nil // no updates?
+	kv.mutex.Lock()
+	defer kv.mutex.Unlock()
+	defer txFinalize(kv, tx)
+
+	// check conflicts
+	if tx.updateAttempted && detectConflicts(kv, tx) {
+		return ErrorConflict
 	}
-	return updateOrRevert(tx.db, tx.meta)
+
+	// save the meta page
+	meta := saveMeta(kv)
+	root := kv.Tree.GetRoot()
+	// transfer updates to the current tree
+	kv.free.curVer = kv.version + 1 // version in the free list
+	writes := []KeyRange(nil)       // collect updated ranges in this TX
+	for iter := tx.pending.Seek(nil, btree.CMP_GT); iter.Valid(); iter.Next() {
+		updated := false
+		key, val := iter.Deref()
+		oldVal, isOld := tx.snapshot.Get(key)
+		switch val[0] {
+		case FLAG_DELETED:
+			updated = isOld
+			deleted := kv.Tree.Delete(&btree.DeleteReq{Key: key})
+			util.Assert(deleted == updated, "Commit: delete mismatch") // assured by conflict detection
+		case FLAG_UPDATED:
+			updated = (!isOld || !bytes.Equal(oldVal, val[1:]))
+			req := btree.UpdateReq{Key: key, Val: val[1:]}
+			kv.Tree.Update(&req)
+			util.Assert(req.Updated == updated, "Commit: update mismatch") // assured by conflict detection
+		default:
+			panic("unreachable")
+		}
+		if updated && len(kv.ongoing) > 1 {
+			writes = append(writes, KeyRange{key, key})
+		}
+	}
+
+	// commit the update
+	if root != kv.Tree.GetRoot() {
+		kv.version++
+		if err := updateOrRevert(kv, meta); err != nil {
+			return err
+		}
+	}
+
+	// keep a history of updated ranges grouped by each TX
+	if len(writes) > 0 {
+		// sort the ranges for faster overlap detection
+		slices.SortFunc(writes, func(r1, r2 KeyRange) int {
+			return bytes.Compare(r1.start, r2.start)
+		})
+		kv.history = append(kv.history, CommittedTX{kv.version, writes})
+	}
+	return nil
+}
+
+// common routines when exiting a transaction
+func txFinalize(kv *KV, tx *KVTX) {
+	// remove myself from `kv.ongoing`
+	idx := slices.Index(kv.ongoing, tx.version)
+	last := len(kv.ongoing) - 1
+	kv.ongoing[idx], kv.ongoing = kv.ongoing[last], kv.ongoing[:last]
+	// find the oldest in-use version
+	minVersion := kv.version
+	for _, other := range kv.ongoing {
+		if versionBefore(other, minVersion) {
+			minVersion = other
+		}
+	}
+	// release the free list
+	kv.free.SetMaxVer(minVersion)
+	// trim `kv.history` if `minVersion` has been increased
+	for idx = 0; idx < len(kv.history); idx++ {
+		if versionBefore(minVersion, kv.history[idx].version) {
+			break // sorted
+		}
+	}
+	kv.history = kv.history[idx:] // sorted
 }
 
 // end a transaction: rollback
 func (kv *KV) Abort(tx *KVTX) {
 	util.Assert(!tx.done, "storage.KV.Abort: transaction is already done")
 	tx.done = true
-	// nothing has written, just revert the in-memory states
-	loadMeta(tx.db, tx.meta)
-	// discard temporaries
-	tx.db.page.nappend = 0
-	tx.db.page.updates = map[uint64][]byte{}
+	// maintain `kv.ongoing` and `kv.history`
+	kv.mutex.Lock()
+	txFinalize(kv, tx)
+	kv.mutex.Unlock()
 }
 
-// KV interfaces
+type KVIter interface {
+	Deref() (key []byte, val []byte)
+	Valid() bool
+	Next()
+}
+
+// an iterator that combines pending updates and the snapshot
+type CombinedIter struct {
+	top *btree.BIter // KVTX.pending
+	bot *btree.BIter // KVTX.snapshot
+	dir int          // +1 for greater or greater-than, -1 for less or less-than
+	// the end of the range
+	cmp int
+	end []byte
+}
+
+func (iter *CombinedIter) Deref() ([]byte, []byte) {
+	var k1, v1, k2, v2 []byte
+	top, bot := iter.top.Valid(), iter.bot.Valid()
+	util.Assert(top || bot, "CombinedIter.Deref: both iterators invalid")
+	if top {
+		k1, v1 = iter.top.Deref()
+	}
+	if bot {
+		k2, v2 = iter.bot.Deref()
+	}
+	// use the min/max key of the two
+	if top && bot && bytes.Compare(k1, k2) == +iter.dir {
+		return k2, v2
+	}
+	if top {
+		return k1, v1[1:]
+	} else {
+		return k2, v2
+	}
+}
+
+func (iter *CombinedIter) Valid() bool {
+	if iter.top.Valid() || iter.bot.Valid() {
+		key, _ := iter.Deref()
+		return btree.CmpOK(key, iter.cmp, iter.end)
+	}
+	return false
+}
+
+func (iter *CombinedIter) Next() {
+	// which B+tree iterator to move?
+	top, bot := iter.top.Valid(), iter.bot.Valid()
+	if top && bot {
+		k1, _ := iter.top.Deref()
+		k2, _ := iter.bot.Deref()
+		switch bytes.Compare(k1, k2) {
+		case -iter.dir:
+			top, bot = true, false
+		case +iter.dir:
+			top, bot = false, true
+		case 0: // equal; move both
+		}
+	}
+	util.Assert(top || bot, "CombinedIter.Next: both iterators invalid")
+	// move B+tree iterators wrt the direction
+	if top {
+		if iter.dir > 0 {
+			iter.top.Next()
+		} else {
+			iter.top.Prev()
+		}
+	}
+	if bot {
+		if iter.dir > 0 {
+			iter.bot.Next()
+		} else {
+			iter.bot.Prev()
+		}
+	}
+}
+
+// point query. combines captured updates with the snapshot
 func (tx *KVTX) Get(key []byte) ([]byte, bool) {
-	return tx.db.Tree.Get(key)
+	tx.reads = append(tx.reads, KeyRange{key, key}) // dependency
+	val, ok := tx.pending.Get(key)
+	switch {
+	case ok && val[0] == FLAG_UPDATED: // updated in this TX
+		return val[1:], true
+	case ok && val[0] == FLAG_DELETED: // deleted in this TX
+		return nil, false
+	case !ok: // read from the snapshot
+		return tx.snapshot.Get(key)
+	default:
+		panic("unreachable")
+	}
 }
-func (tx *KVTX) Seek(key []byte, cmp int) *btree.BIter {
-	return tx.db.Tree.Seek(key, cmp)
+
+func cmp2dir(cmp int) int {
+	if cmp > 0 {
+		return +1
+	} else {
+		return -1
+	}
 }
+
+// range query. combines captured updates with the snapshot
+func (tx *KVTX) Seek(key1 []byte, cmp1 int, key2 []byte, cmp2 int) KVIter {
+	util.Assert(cmp2dir(cmp1) != cmp2dir(cmp2), "Seek: invalid cmp directions")
+	lo, hi := key1, key2
+	if cmp2dir(cmp1) < 0 {
+		lo, hi = hi, lo
+	}
+	tx.reads = append(tx.reads, KeyRange{lo, hi}) // FIXME: slightly larger
+	return &CombinedIter{
+		top: tx.pending.Seek(key1, cmp1),
+		bot: tx.snapshot.Seek(key1, cmp1),
+		dir: cmp2dir(cmp1),
+		cmp: cmp2,
+		end: key2,
+	}
+}
+
+// capture updates
 func (tx *KVTX) Update(req *btree.UpdateReq) bool {
-	return tx.db.Tree.Update(req)
+	tx.updateAttempted = true
+	// check the existing key against the update mode
+	old, exists := tx.Get(req.Key) // also add a dependency
+	if req.Mode == btree.MODE_UPDATE_ONLY && !exists {
+		return false
+	}
+	if req.Mode == btree.MODE_INSERT_ONLY && exists {
+		return false
+	}
+	if exists && bytes.Equal(old, req.Val) {
+		return false
+	}
+	// insert the flagged KV
+	flaggedVal := append([]byte{FLAG_UPDATED}, req.Val...)
+	tx.pending.Update(&btree.UpdateReq{Key: req.Key, Val: flaggedVal})
+	req.Added = !exists
+	req.Updated = true
+	req.Old = old
+	return true
 }
+
 func (tx *KVTX) Set(key []byte, val []byte) bool {
 	return tx.Update(&btree.UpdateReq{Key: key, Val: val})
 }
+
 func (tx *KVTX) Del(req *btree.DeleteReq) bool {
-	return tx.db.Tree.Delete(req)
+	tx.updateAttempted = true
+	exists := false
+	if req.Old, exists = tx.Get(req.Key); !exists {
+		return false
+	}
+	tx.pending.Update(&btree.UpdateReq{Key: req.Key, Val: []byte{FLAG_DELETED}})
+	return true
 }
